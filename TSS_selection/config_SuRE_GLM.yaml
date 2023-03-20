@@ -1,0 +1,56 @@
+outdir: '/DATA/usr/c.leemans/projects/SuRE/SuRE_GLM_meta_gene_plots'
+
+transcripts:
+    gencode.v27: /DATA/usr/c.leemans/data/tracks/hg19/gencode.v27lift37.annotation.gff3.gz
+
+
+tissue_expression:
+    /DATA/usr/c.leemans/data/tracks/hg19/hg19.cage_peak_phase1and2combined_counts.osc.txt.gz
+
+transcript_selection:
+    fantom:
+        /DATA/usr/c.leemans/data/tracks/hg19/hg19.cage_peak_phase1and2combined_coord.bed.gz
+
+chrom_sizes: /DATA/usr/c.leemans/data/hg19/hg19.chrom.sizes
+
+window:
+    SuRE23_GLM_plus:
+        "/DATA/usr/c.leemans/data/tracks/hg19/\
+        SuRE_GLM_track_fix_K_b0050_plus.bw"
+    SuRE23_GLM_minus:
+        "/DATA/usr/c.leemans/data/tracks/hg19/\
+        SuRE_GLM_track_fix_K_b0050_minus.bw"
+    SuRE42-45_GLM_plus:
+        "/DATA/usr/c.leemans/data/tracks/hg19/\
+        SURE_elasticNet_allele_K562_plus.bw"
+    SuRE42-45_GLM_minus:
+        "/DATA/usr/c.leemans/data/tracks/hg19/\
+        SURE_elasticNet_allele_K562_minus.bw"
+
+missingDataAsZero:
+    SuRE23_GLM_plus: True
+    SuRE23_GLM_minus: True
+    SuRE42-45_GLM_plus: True
+    SuRE42-45_GLM_minus: True
+
+scaled_param:
+    a: 500
+    b: 2000
+    unscaled3: 5000
+    unscaled5: 5000
+    body_length: 11000
+    bs: 100
+
+window_param:
+    a:  500
+    b:  2000
+    bs: 10
+
+smooth_k: 1
+
+#
+# tss=/DATA/usr/c.leemans/projects/SuRE/SuRE_GLM_meta_gene_plots/raw_data/gencode.v27-tss.bed.gz
+# dist=50
+# exp=/DATA/usr/c.leemans/data/tracks/hg19/hg19.cage_peak_phase1and2combined_coord.bed.gz
+# selection=/DATA/usr/c.leemans/projects/SuRE/SuRE_GLM_meta_gene_plots/selection/gencode.v27-fantom-tss.txt
+# link=/DATA/usr/c.leemans/projects/SuRE/SuRE_GLM_meta_gene_plots/selection/gencode.v27-fantom-link.txt

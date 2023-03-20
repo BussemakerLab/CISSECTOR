@@ -1,0 +1,192 @@
+import os
+import pandas
+import inspect
+
+filename = inspect.getframeinfo(inspect.currentframe()).filename
+path = os.path.dirname(os.path.abspath(filename))
+
+SuRE_fwd = '/DATA/scratch/usr/c.leemans/data/tracks/hg19/SURE_elasticNet_allele_K562_plus.bw'
+SuRE_rev = '/DATA/scratch/usr/c.leemans/data/tracks/hg19/SURE_elasticNet_allele_K562_minus.bw'
+
+promoter_bed = '/DATA/scratch/usr/c.leemans/projects/SuRE/SuRE_K562/tss_region_1024.bed'
+
+psam_dir = '/DATA/scratch/usr/c.leemans/Programs/REDUCE_Suite/data/PSAMs/Natoli_Curated'
+
+outdir = '/DATA/scratch/usr/c.leemans/projects/SuRE/SuRE_K562'
+
+meta_file = 'psam_chip_link.txt'
+
+meta_dt = pandas.read_table('/'.join((outdir, meta_file)),
+                            dtype={'psam_id': str})
+
+
+chrom_size = '/DATA/scratch/usr/c.leemans/data/hg19/hg19.chrom.sizes'
+
+
+def get_all(input_dt, path):
+    for TF in input_dt.TF.unique():
+        yield(('{path}/promoter_affinity_20210129/cross-correlation/'
+               '{TF}.rds').format(path=outdir, TF=TF))
+
+rule all:
+    input:
+        get_all(meta_dt, outdir)
+
+rule crossCorrelation:
+    input:
+        bw = '{path}/affinity/{name}.bw',
+        plus = SuRE_fwd,
+        minus = SuRE_rev,
+        bed = promoter_bed
+    output:
+        '{path}/cross-correlation/{name}.rds'
+    shell:
+        '{path}/cross_correlation_promoter.R --bw {input.bw}'
+        '                                    --plus {input.plus}'
+        '                                    --minus {input.minus}'
+        '                                    --out {output}'
+        '                                    --bed {input.bed}'
+
+rule bedGraphToBigWig:
+    input:
+        bg='{name}.bg',
+        chrom_size=chrom_size
+    output:
+        bw='{name}.bw'
+    shell:
+        "bedGraphToBigWig {input.bg} {input.chrom_size} {output.bw}"
+
+rule sort:
+    input:
+        '{name}.bg.tmp'
+    output:
+        temp('{name}.bg')
+    shell:
+        "sort -k1,1 -k2,2n {input} |"
+        "    awk -vOFS='\\t' '{{"
+        "        if (seq==$1 && start==$2){{"
+        "            score = $4>score?$4:score"
+        "        }} else {{"
+        "            if (NR != 1){{"
+        "                print seq, start, start + 1, score;"
+        "            }}"
+        "            score = $4;"
+        "            seq = $1;"
+        "            start = $2;"
+        "        }}"
+        "    }} END {{"
+        "        print seq, start, start + 1, score"
+        "    }}' "
+        "    > {output}"
+
+rule getFasta:
+    input:
+        bed='{outdir}/merge_peak/{TF}.bed',
+        fa='/DATA/scratch/usr/c.leemans/data/hg19/hg19_1-22_XYM.fa'
+    output:
+        '{outdir}/fasta/{TF}.fa'
+    shell:
+        'bedtools getfasta -fi {input.fa}'
+        '                  -bed {input.bed}'
+        '                  > {output}'
+
+rule profile:
+    input:
+        '{outdir}/matrix/{TF}.matrix.gz',
+        '{outdir}/affinity/{TF}.txt'
+    output:
+        '{outdir}/profile/{TF}.pdf'
+    shell:
+        '{path}/plot_stranded_profiles.R -s {input[0]} -a {input[1]} -p {output}'
+
+
+rule matrix:
+    input:
+        bed='{outdir}/bed/{name}.bed',
+        fwd=SuRE_fwd,
+        rev=SuRE_rev
+    output:
+        '{outdir}/matrix/{name}.matrix.gz',
+    shell:
+        'computeMatrix reference-point -R {input.bed}'
+        '                              -S {input.fwd} {input.rev}'
+        '                              -o {output}'
+        '                              --referencePoint center'
+        '                              -bs 1'
+        '                              -b 100 -a 100'
+
+
+rule computeMean:
+    input:
+        bed='{outdir}/bed/{name}.bed',
+        fwd=SuRE_fwd,
+        rev=SuRE_rev
+    output:
+        '{outdir}/mean/{name}.txt',
+        temp('{outdir}/mean/{name}.npz')
+    shell:
+        'multiBigwigSummary BED-file -b {input.fwd} {input.rev}'
+        '                            -o {output[1]}'
+        '                            --BED {input.bed}'
+        '                            --outRawCounts {output[0]}'
+
+rule bed:
+    input:
+        '{outdir}/affinity/{name}.txt'
+    output:
+        '{outdir}/bed/{name}.bed'
+    shell:
+        "tail -n+2 {input} | "
+        "    awk -vOFS='\t' '{{print $1, $2 + $4 - 5, $2 + $4 + 5, FNR, $6, $5}}'"
+        "    > {output}"
+
+
+def get_bed(meta_dt, outdir, TF):
+    TF = TF.split('.')[0]
+    input_dt = meta_dt[['TF', 'file_id', 'exp_id']].drop_duplicates()
+    selection = input_dt[input_dt.TF==TF]
+    for i, row in selection.iterrows():
+        yield('{outdir}/bed/{TF}_{file_id}_{exp_id}.bed'.format(outdir=outdir,
+                                                                **row))
+
+
+
+
+rule merge:
+    input:
+        lambda wildcards: get_bed(meta_dt, **wildcards)
+    output:
+        '{outdir}/merge_peak/{TF}.bed'
+    shell:
+        'cat {input} | sort -k1,1 -k2,2n | bedtools merge > {output}'
+
+
+
+
+def get_psam(meta_dt, psam_dir, outdir, TF):
+    input_dt = meta_dt[['TF', 'psam_id']].drop_duplicates()
+    selection = input_dt.query('TF==@TF')
+    for i, row in selection.iterrows():
+        yield('{psam_dir}/{TF}_{psam_id}.xml'.format(psam_dir=psam_dir, **row))
+
+
+rule affinity:
+    input:
+        fa='{outdir}/fasta/{TF}.fa',
+        psam=lambda wildcards: get_psam(meta_dt, psam_dir, **wildcards)
+    output:
+        '{outdir}/promoter_affinity_20210129/affinity/{TF}.txt',
+        temp('{outdir}/promoter_affinity_20210129/affinity/{TF}.bg.tmp'),
+        temp('{outdir}/promoter_affinity_20210129/affinity/{TF}.watson.bg.tmp'),
+        temp('{outdir}/promoter_affinity_20210129/affinity/{TF}.crick.bg.tmp'),
+        '{outdir}/promoter_affinity_20210129/affinity/{TF}.stat'
+    wildcard_constraints:
+        TF='[^.^_]+'
+    shell:
+        '{path}/find_max_affinity.py --psam {input.psam}'
+        '                            --seq {input.fa}'
+        '                            --stats {output[4]}'
+        '                            --out {output[0]}'
+        '                            --aff {output[1]}'
+        '                            --watson {output[2]}'
+        '                            --crick {output[3]}'

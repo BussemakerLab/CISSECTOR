@@ -1,0 +1,369 @@
+```{r}
+library(data.table)
+library(rtracklayer)
+library(ggplot2)
+library(patchwork)
+#
+tss_dt = fread('tss_selection_gene_name.txt',
+               col.names=c('seqnames', 'start', 'transcript_id', 'strand',
+                           'gene_id', 'mean', 'tissues_expr', 'gene_name'))
+
+# top200 = fread('SuRE_K562/top200Annotation.csv')
+#
+# name_vec = c('BIRC5', 'RET', 'IGF1', 'LDLR', 'PIK3CA', 'XRCC1',
+#              'CCL2', 'GJB2', 'CD44', 'KDR', 'RET', 'TNFSF10',
+#              'NOS2')
+tss_dt[,ensembl_id := gsub('[.].*', '', gene_id)]
+top_tss = tss_dt[, .SD[which.max(tissues_expr)], by='gene_name']
+
+name_dt = unique(top_tss[,c('gene_name', 'ensembl_id', 'start')])
+names(name_dt)[3] = 'TSS'
+
+CAGE_file_list = list.files("/DATA/scratch/usr/c.leemans/data/fantom",
+                       pattern='ENCFF', full.names=T)
+
+names(CAGE_file_list) = gsub(".*/(.*)_V24.*", "\\1", CAGE_file_list)
+CAGE_list = lapply(names(CAGE_file_list), function(name){
+    CAGE_dt = fread(CAGE_file_list[[name]])[, c(1:4, 6:8)]
+
+    colnames(CAGE_dt) = c('seqnames', 'start', 'end', 'TSS_ID',
+                          'strand', name, 'gene_id')
+    return(CAGE_dt)
+})
+
+CAGE_dt = Reduce(merge, CAGE_list)
+
+CAGE_dt[, HepG2 := HepG2_rep1 + HepG2_rep2]
+CAGE_dt[, K562 := K562_rep1 + K562_rep2]
+
+CAGE_dt[,ensembl_id := gsub('[.].*', '', gene_id)]
+
+tss_expr = merge(CAGE_dt, name_dt,
+                 by='ensembl_id')
+
+selection = tss_expr[, .SD[which.max(K562)], by='gene_name']
+
+
+
+```
+
+
+```{r}
+colorlut <- c(colorRampPalette(c("#ffffff", "#000000"))(91), rep("#000000",10)) # height color lookup table
+
+
+triangle_dt <- function(center, upstream = 600, downstream=600,
+                        cutoff = 600, binsize=10, offset=0,
+                        path = "/DATA/scratch/usr/c.leemans/data/tracks/hg19/",
+                        filePart = "SURE_elasticNet_allele_K562_",
+                        rev_comp = F) {
+    start_time <- Sys.time()
+    center_pos <- start(center)
+    xregion <- promoters(center, upstream=upstream,
+                         downstream=downstream)
+    if (upstream + downstream < cutoff){
+      region <- resize(xregion, width=cutoff, fix="center")
+    } else {
+      region <- xregion
+    }
+    half_bin = round(binsize/2)
+    start_i = (end(region) - start(region) - half_bin) %% binsize
+    if (start_i < half_bin){
+        start(region) = start(region) + start_i - half_bin
+    }
+    if (rev_comp==F){
+        strand <- ifelse(as.character(strand(center)) == "+", "plus", "minus")
+    } else {
+        strand <- ifelse(as.character(strand(center)) == "+", "minus", "plus")
+    }
+    file <- paste0(path, filePart, strand, ".bw")
+
+    suppressWarnings(glm <- import(file, selection = BigWigSelection(region),
+                                   as = "NumericList")[[1]] + offset)
+
+    i <- seq(((end(region) - start(region) - half_bin) %% binsize) + 1,
+             end(region) - start(region), binsize)
+
+    xlim <- c(start(xregion), end(xregion))
+    if(strand == "minus"){
+        i <- rev(i)
+        xlim <- rev(xlim)
+    }
+    i_list = lapply(i, function(n){(n-half_bin):(n+half_bin-1)})
+    ## to make use of fast matrix operations, we first are going to
+    ## create a slightly tilted triangle in a matrix.
+    ## if we have a triangle like this:
+
+    ##         10
+    ##       8   9
+    ##     5   6   7
+    ##   1   2   3   4
+
+    ## in the matrix, it will look like this
+    ## 1  5  8  10
+    ##    2  6  9
+    ##       3  7
+    ##          4
+
+    max_bin_i = round(cutoff / binsize)
+    mat <- matrix(0, length(i), length(i))
+    glm_vec = vector('numeric', length=length(i))
+
+    for(n in 1:length(i)){
+        glm_vec[n] = sum(glm[i_list[[n]]])
+        mat[1:n,n:length(i)] <- mat[1:n,n:length(i)] + sum(glm[i_list[[n]]])
+        mat[n,1:(n-1)] <- NA
+        mat[n,(1:length(i)) > n + max_bin_i] <- NA
+    }
+
+    start_mat <- matrix(start(region) + i - 1, nrow = length(i), ncol = length(i))
+
+    end_mat <- matrix(start(region) + i - 1, nrow = length(i), ncol = length(i), byrow = T)
+
+    end_time <- Sys.time()
+    print(end_time - start_time)
+    x_mat <- (start_mat + end_mat)[!is.na(mat)]/2
+    y_mat <- abs(end_mat - start_mat)[!is.na(mat)]
+    #
+    # dt = data.table(x=x_mat, y=y_mat, score=mat[!is.na(mat)],
+    #                 x_rel = (x_mat - center_pos) * ifelse(strand=='plus', -1, 1))
+    #
+
+
+    x_vec = (start(region):end(region))[i]
+    # flat_dt = data.table(score=glm_vec,
+    #                      x = x_vec,
+    #                      x_rel = (x_vec - center_pos) * ifelse(strand=='plus', -1, 1))
+    #
+    ##TODO: make sure the spacing up and downstream don't get considered in the
+    ##      calculation
+
+    if (strand=='plus'){
+        dt = data.table(x=x_mat, y=y_mat, score=mat[!is.na(mat)],
+                      x_rel = (x_mat - center_pos))
+        mat_dt = dt[x_rel <= downstream & x_rel >= -upstream, ]
+
+        flat_region = region
+        start(flat_region) = start(flat_region) - round(0.2 * upstream)
+        end(flat_region) = end(flat_region) + round(0.2 * downstream)
+        suppressWarnings(flatglm <- import(file, selection = BigWigSelection(flat_region),
+                                            as = "NumericList")[[1]] + offset)
+
+        flat_dt = data.table(score=flatglm,
+                             x = start(flat_region):end(flat_region))
+        flat_dt[,x_rel := x - center_pos]
+    } else {
+        dt = data.table(x=x_mat, y=y_mat, score=mat[!is.na(mat)],
+                      x_rel = (center_pos - x_mat))
+        mat_dt = dt[x_rel <= upstream & x_rel >= -downstream, ]
+
+
+        flat_region = region
+        start(flat_region) = start(flat_region) - round(0.2 * downstream)
+        end(flat_region) = end(flat_region) + round(0.2 * upstream)
+        suppressWarnings(flatglm <- import(file, selection = BigWigSelection(flat_region),
+                                            as = "NumericList")[[1]] + offset)
+
+        flat_dt = data.table(score=flatglm,
+                             x = start(flat_region):end(flat_region))
+        flat_dt[, x_rel := center_pos - x]
+    }
+    setkey(flat_dt, 'x')
+    return(list(mat_dt=mat_dt,
+                flat_dt=flat_dt,
+                region=region))
+}
+classical = fread('SuRE_K562/classical_examples/cl20210610_BIRC5_Fang_et_al_predictions.tsv')
+
+
+
+most_expr = c(unlist(selection[order(K562, decreasing=T)[1:50], 'gene_name']),
+              'BIRC5', 'GBAP1', 'LDLR', 'CD44', 'HARS')
+
+top_tss = selection[gene_name%in%most_expr, ]
+
+top_tss[gene_name=='BIRC5', TSS:=classical[name=='TSS', 'start']]
+
+center_gr = GRanges(seqnames=top_tss$seqnames,
+                    IRanges(start=top_tss$TSS, width=1),
+                    strand=top_tss$strand)
+names(center_gr) = top_tss$gene_name
+
+
+
+classical[,i:=1:nrow(classical)]
+classic_melt = melt(classical, measure.vars=c('start','end'),
+                    value.name='x_rel')
+classic_melt[, x:=x_rel-start(center_gr['BIRC5'])]
+
+
+classical[, center_rel := (start + end)/2 ]
+classical[, center := center_rel - start(center_gr['BIRC5'])]
+
+classical[, width := end-start]
+
+
+max_fragsize = 600
+max_dist = 600
+bs = 10
+offset_K562 = readRDS("SuRE_K562/SuRE_42-45/optimalFitOffsetCoefficients_K562.rds")
+offset_HEPG2 = readRDS("SuRE_K562/SuRE_42-45/optimalFitOffsetCoefficients_HEPG2.rds")
+
+mat_list = lapply(c('center_gr'), function(name){
+    center_pos = center_gr[name]
+    triangle_list_K562 = triangle_dt(center_pos, upstream=max_dist,
+                                     downstream=max_dist,
+                                     filePart = "SURE_elasticNet_allele_K562_",
+                                     cutoff = max_fragsize, binsize=10,
+                                     offset=offset_K562$width)
+
+    triangle_list = list(mat_K562 = triangle_list_K562$mat_dt,
+                         flat_K562 = triangle_list_K562$flat_dt,
+                         region = triangle_list_K562$region)
+    return(triangle_list)
+})
+names(mat_list) = names(center_gr)
+
+
+
+
+corners = data.frame(x=c(-max_dist, -max_dist + max_fragsize/2,
+                         max_dist-max_fragsize/2, max_dist),
+                     y=c(0,max_fragsize, max_fragsize, 0))
+trapezoid = cbind(corners[c(1,2,2,3,3,4), ], line_n=c(1,1,2,2,3,3))
+
+promoters = classical[grep('P[0-9]',name),]
+
+
+
+tops = promoters[width < 600, list(x=c(start-start(center_gr['BIRC5']), center),
+                                   y=c(0,width)), by= c('name')]
+tops = rbind(tops, list('P4', promoters$end[1]-start(center_gr['BIRC5']), 0))
+
+pdf('cl20210622_raw_triangles.pdf', useDingbats=F, width=10, height=5)
+for (name in names(center_gr)){
+    center_pos = center_gr[name]
+    center_strand = as.character(strand(center_pos))
+    mat_K562 = mat_list[[name]]$mat_K562
+    flat_K562 = mat_list[[name]]$flat_K562
+    sec = start(center_pos) * ifelse(center_strand=='+', 1, -1)
+
+    max_color = max(mat_K562[, exp(score)])
+    p1 = ggplot(mat_K562, aes(x=x_rel, y=y, fill=exp(score))) +
+        geom_tile(width=10, height=10) +
+        geom_line(data=trapezoid, aes(x=x,y=y, group=line_n), inherit.aes=F) +
+        theme_bw() +
+        scale_fill_gradientn(colours=colorlut, limits=c(0,max_color)) +
+        ylab('reporter length') +
+        xlab('##chromosome##') +
+        coord_cartesian(ylim=c(0,max_fragsize),
+                        xlim=c(-max_dist,max_dist)) +
+        scale_x_continuous(sec.axis=~abs(. + sec)) +
+        theme(axis.title.x=element_blank())
+
+
+
+
+    p2 = ggplot(flat_K562, aes(x=x_rel, y=score, fill=score > 0)) +
+        geom_histogram(stat='identity') +
+        theme_bw() +
+        xlab('coefficients') +
+        theme(legend.position="none") +
+        coord_cartesian(xlim=c(-max_dist,max_dist))
+
+    if (name=="BIRC5"){
+        p1 = p1 +
+            geom_line(data=tops, aes(x=x, y=y, group=name),
+                      inherit.aes=F, linetype="dashed", color='red')
+        p2 = p2 +
+            geom_line(data=classic_melt[grep('TSS|P[0-9]',name, invert=T),],
+                      aes(y=0, x=x, group=i), inherit.aes=F, size=3) +
+            geom_vline(data=tops[y==0], aes(xintercept=x),
+                      inherit.aes=F, linetype="dashed", color='red')
+    }
+
+
+    print(p1 + p2 + plot_annotation(title = name) +
+          plot_layout(ncol=1, heights=c(2, 1)))
+}
+
+dev.off()
+
+
+
+
+BIRC5 = triangle_dt(center_gr['BIRC5'])
+
+plot_mat <-function(mat, bs, cutoff, max_color){
+    print(exp(max_color))
+    print(max(exp(mat$score)))
+  p = ggplot(mat, aes(x=x_rel, y=y, fill=exp(score))) +
+    geom_tile(width=bs, height=bs) +
+    theme_bw() +
+    scale_fill_gradientn(colours=colorlut, limits=c(0,exp(max_color))) +
+    ylab('reporter length') +
+    xlab('##chromosome##') +
+    coord_fixed(ylim=c(0,cutoff)) +
+    theme(axis.title.x=element_blank())
+  return(p)
+}
+
+p = plot_mat(BIRC5$mat, 10, 500, BIRC5$mat[,max(score)]) +
+    geom_point(data=classical[grep('P[0-9]',name),], aes(x=center, y=width),
+               inherit.aes=F, shape=21, color='black')
+
+pdf('cl20210519_BIRC1_classical_scatter.pdf', useDingbats=F)
+
+ggplot(classical[grep('P[0-9]',name),], aes(x=K562_sense, y=as.numeric(color), label=name)) +
+    geom_point() +
+    geom_text() +
+    ylab('luciferase control') +
+    theme_bw()
+
+
+dev.off()
+
+
+CD44 = triangle_dt(center_gr['CD44'])
+
+raw = readRDS('SuRE_K562/chr11_2/element_annotation.rds')
+
+cd44_raw = as.data.table(raw[raw$end > start(center_gr['CD44']) - 600 &
+                             raw$start < start(center_gr['CD44']) + 600,])
+cd44_raw[, i:=1:nrow(cd44_raw)]
+cd44_raw[, center:=(start + end) / 2]
+cd44_raw[, length:=end - start]
+cd44_raw[, x_rel:=center - start(center_gr['CD44'])]
+
+cd44_raw[, norm_K562 := exp(log(K562)-offset_K562)]
+
+max_color = max(cd44_raw[strand=='+', max(norm_K562)],
+                max(exp(CD44$mat$score)))
+cutoff = 600
+cd44_melt = melt(cd44_raw, measure.vars=c('start', 'end'))
+
+
+pdf('cl20210427_cd44_raw_triangle.pdf', useDingbats=F)
+ggplot(cd44_raw[strand=='+', ], aes(x=x_rel, y=length, fill=norm_K562)) +
+    geom_tile(width=10, height=10) +
+    theme_bw() +
+    scale_fill_gradientn(colours=colorlut, limits=c(0,max_color)) +
+    ylab('reporter length') +
+    xlab('##chromosome##') +
+    coord_fixed(ylim=c(0,cutoff)) +
+    theme(axis.title.x=element_blank())
+
+ggplot(cd44_melt, aes(x=value, y=norm_K562, group=i)) +
+    geom_line() +
+    ylim(0,max_color) +
+    theme_bw()
+
+dev.off()
+
+
+max_color = max(c(log10()))
+p = plot_mat(CD44$mat, 10, 500)
+
+
+IGF1_raw = as.data.table(raw[raw$end > 102873500 &
+                             raw$start < 102875000,])

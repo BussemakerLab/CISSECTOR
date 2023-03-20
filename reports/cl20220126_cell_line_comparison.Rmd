@@ -1,0 +1,305 @@
+```{r}
+library(jsonlite)
+library(data.table)
+library(stringr)
+library(rtracklayer)
+library(ggplot2)
+library(patchwork)
+
+unibind_dir = '/DATA/scratch/usr/c.leemans/data/tracks/hg38/unibind/'
+
+parse_pwm <- function(url){
+	motif = fromJSON(url)
+	pwm = data.frame(motif$pfm)
+	minsites = min(colSums(pwm))
+	type = motif$type
+    return(list(minsites=minsites, type=motif$type))
+}
+
+
+metadata = fread(paste0(unibind_dir, 'metadata_robust.txt'))
+metadata[,tissue:=gsub("_myelogenous_leukemia", "", tissue)]
+metadata[,tissue:=gsub("_hepatoblastoma", "", tissue)]
+
+pwm = metadata[,parse_pwm(paste0('http://jaspar.genereg.net/api/v1/matrix/', motif)),
+               by=c("motif", 'TF')]
+
+
+pwm[,not_chip:=ifelse(type=='ChIP-seq', 0, 1)]
+
+pwm_selection = pwm[,.SD[order(not_chip, minsites, decreasing=T)[1]], by="TF"]
+
+metadata_selection = metadata[motif%in%pwm_selection$motif &
+                              tissue%in%c("K562", "HepG2"), ]
+
+
+merge_bed <- function(bed1, bed2){
+	missing = !bed2%in%bed1
+	if (any(missing)){
+		return(c(bed1, bed2[!bed2%in%bed1]))
+	} else {
+		return(bed1)
+	}
+}
+
+parse_bed <- function(dt){
+	file_name = dt[, paste0(unibind_dir, file)]
+	bed_list = lapply(file_name, import.bed)
+	bed_gr = bed_list[[1]]
+	if (length(bed_list) > 1){
+		for (bed in bed_list[2:length(bed_list)]){
+			bed_gr = merge_bed(bed_gr, bed)
+		}
+	}
+	return(as.data.table(bed_gr))
+}
+
+bed_dt = metadata_selection[,parse_bed(.SD), by=c('tissue', 'TF', 'motif')]
+
+write_bed <- function(dt, celltype){
+
+	fwrite(dt[,c('seqnames', 'start', 'end', 'name', 'score', 'strand')],
+		   file=paste0(unibind_dir, celltype, '_most_minsites_non_chip.bed'),
+	       sep='\t', col.names=F)
+}
+bed_dt[,name:=paste(name, motif, sep='_')]
+bed_dt[,write_bed(.SD, tissue) , by='tissue']
+
+```
+
+
+```{r}
+track_dir = '/DATA/scratch/usr/c.leemans/data/tracks/'
+
+import_rna <- function(r1, r2){
+	r1_dt = fread(paste0(track_dir, 'hg38/', r1))
+	r2_dt = fread(paste0(track_dir, 'hg38/', r2))
+	return(data.table(gene_id=r1_dt$gene_id,
+	                  mean_FPKM=(r1_dt$pme_FPKM + r2_dt$pme_FPKM) / 2))
+}
+
+rna_HEPG2 = import_rna("HepG2_RNA_r1_gencode.v29_gene_polyA_ENCFF168QKW.tsv",
+                       "HepG2_RNA_r2_gencode.v29_gene_polyA_ENCFF831QQF.tsv")
+
+
+rna_K562 = import_rna("K562_RNA_r1_gencode.v29_gene_polyA_ENCFF068NRZ.tsv",
+                      "K562_RNA_r2_gencode.v29_gene_polyA_ENCFF928YLB.tsv")
+
+rna_dt = data.table(gene_id=rna_HEPG2$gene_id,
+                    HEPG2=rna_HEPG2$mean_FPKM,
+				    K562=rna_K562$mean_FPKM,
+				    key='gene_id')
+
+
+
+tss_dt = fread('tss_selection_gene_name.txt',
+               col.names=c('seqnames', 'start', 'transcript_id', 'strand',
+                           'gene_id', 'mean', 'tissues_expr', 'gene_name'))
+
+tss_dt[,ensembl_id := gsub('[.].*', '', gene_id)]
+
+symbol_dt = unique(tss_dt[,c('ensembl_id', 'gene_name')])
+setkey(symbol_dt, "ensembl_id")
+
+rna_dt[,ensembl_id := gsub('[.].*', '', gene_id)]
+
+rna_name = merge(symbol_dt, rna_dt, by="ensembl_id")
+setkey(rna_name, 'gene_name')
+
+rna_name[,fd:=K562/HEPG2]
+```
+
+
+
+```{r}
+top_tss = tss_dt[, .SD[which.max(tissues_expr)], by='gene_name']
+
+high_rna = rna_dt[HEPG2 >50 & K562 > 50,]
+
+selection = top_tss[ensembl_id%in%high_rna$ensembl_id,]
+
+center_gr = GRanges(seqnames=selection$seqnames,
+                    IRanges(start=selection$start, width=1),
+                    strand=selection$strand)
+names(center_gr) = selection$gene_name
+
+offset_K562 = readRDS("SuRE_K562/SuRE_42-45/optimalFitOffsetCoefficients_K562.rds")
+offset_HEPG2 = readRDS("SuRE_K562/SuRE_42-45/optimalFitOffsetCoefficients_HEPG2.rds")
+
+
+CAGE_bw_list = list.files(paste0(track_dir, "hg19"), pattern="CAGE_.*_ENCFF", full.names=T)
+names(CAGE_bw_list) = gsub('.*CAGE_(.*)_ENCFF.*', '\\1', CAGE_bw_list)
+CAGE_names = unique(gsub('_plus|_minus', '', names(CAGE_bw_list)))
+
+filePart = "SURE_elasticNet_allele_"
+max_dist = 1000
+
+
+tf_melt_list = lapply(names(center_gr), function(name){
+    center = center_gr[name]
+    center_pos <- start(center)
+    region <- promoters(center, upstream=max_dist,
+                        downstream=max_dist)
+
+    strand <- ifelse(as.character(strand(center)) == "+", "plus", "minus")
+
+	TF_HepG2 = import(paste0(track_dir,
+		                     "hg19/unibind/HepG2_most_minsites_non_chip.bed"),
+	                  which=region)
+
+	TF_K562 = import(paste0(track_dir,
+					  "hg19/unibind/K562_most_minsites_non_chip.bed"),
+				  which=region)
+
+	TF_gr = c(TF_HepG2, TF_K562[!TF_K562%in%TF_HepG2])
+	TF_gr$present_K562 = TF_gr%in%TF_K562
+	TF_gr$present_HepG2 = TF_gr%in%TF_HepG2
+
+	TF_dt = as.data.table(TF_gr)
+	TF_dt[,present:=ifelse(present_K562 & present_HepG2, 'both',
+                           ifelse(present_K562, "K562", "HepG2"))]
+	TF_dt[,TF_name:=gsub('_.*', '', name)]
+	TF_dt[,fd:=rna_name[TF_name, 'fd']]
+	TF_dt[,i:=1:nrow(TF_dt)]
+	TF_dt_melt = melt(TF_dt, measure.vars=c('start', 'end'), variable.name='side',
+                      value.name='x')
+
+    if (strand == 'plus'){
+        TF_dt_melt[, x_rel := x - start(center)]
+    } else {
+        TF_dt_melt[, x_rel := start(center) - x]
+    }
+	return(TF_dt_melt)
+})
+names(tf_melt_list)=names(center_gr)
+
+selection = c('ARCN1', 'CDC34', 'COX8A', 'ATP5L', 'CYTOR', 'IFITM2', 'STT3A',
+              'TPM3', 'CCNL1', 'CTSC', 'DYNLL1', 'MGST1', 'LGALS1', 'SCFD1',
+		      'TOMM7', 'NDUFA10')
+
+pdf('cl20220126_favorite_celltype_tracks_selection.pdf', useDingbats=F, width=10, height=12)
+# for (name in sample(names(center_gr),50)){
+
+for (name in selection){
+    center = center_gr[name]
+    center_pos <- start(center)
+    region <- promoters(center, upstream=max_dist,
+                        downstream=max_dist)
+
+    strand <- ifelse(as.character(strand(center)) == "+", "plus", "minus")
+
+    K562_file <- paste0(track_dir, "hg19/", filePart, "K562_", strand, ".bw")
+    HepG2_file <- paste0(track_dir, "hg19/", filePart, "HEPG2_", strand, ".bw")
+
+    suppressWarnings(glm_K562 <- import(K562_file, selection = BigWigSelection(region),
+                                        as = "NumericList")[[1]] + offset_K562$width)
+    suppressWarnings(glm_HepG2 <- import(HepG2_file, selection = BigWigSelection(region),
+                                        as = "NumericList")[[1]] + offset_HEPG2$width)
+
+    signal_list = lapply(CAGE_names, function(name){
+        file = CAGE_bw_list[paste(name, strand, sep='_')]
+        unlist(import(file, selection=BigWigSelection(region),
+               as="NumericList"))
+    })
+    signal_df = do.call(cbind, signal_list)
+    colnames(signal_df) = CAGE_names
+    mean_dt = data.table(x = start(region):end(region),
+                         'CAGE_HepG2' = rowMeans(signal_df[, c('HepG2_rep1', 'HepG2_rep2')]),
+                         'CAGE_K562' = rowMeans(signal_df[, c('K562_rep1', 'K562_rep2')]),
+                         'glm_K562' = glm_K562,
+                         'glm_HepG2' = glm_HepG2)
+    if (strand == 'plus'){
+        mean_dt[, x_rel := x - start(center)]
+    } else {
+        mean_dt[, x_rel := start(center) - x]
+    }
+    glm_min = min(mean_dt[,c('glm_K562', 'glm_HepG2')])
+    glm_max = max(mean_dt[,c('glm_K562', 'glm_HepG2')])
+
+
+    CAGE_max = max(mean_dt[,c('CAGE_K562', 'CAGE_HepG2')])
+
+	TF_dt_melt = tf_melt_list[[name]]
+
+    sec = start(center) * ifelse(strand=='plus', 1, -1)
+    break_vec = -4:4*200
+
+    p1 = ggplot(mean_dt, aes(x=x_rel, y=glm_K562, fill=glm_K562 > 0)) +
+        geom_histogram(stat='identity') +
+        theme_bw() +
+        ggtitle('GLM K562') +
+        ylab('coefficients') +
+        xlab('relative position') +
+        theme(legend.position="none",
+              plot.title=element_text(margin=margin(t=40,b=-30))) +
+        coord_cartesian(xlim=c(-900,900),
+                        ylim=c(glm_min, glm_max)) +
+        scale_x_continuous(sec.axis=~abs(. + sec),
+                           breaks=break_vec)
+
+	p2 = ggplot(TF_dt_melt, aes(x=x_rel, y=factor(present, levels=c('HepG2', 'both', 'K562')),
+	                            color=present, group=i)) +
+		geom_line(size=2) +
+		geom_text(data=TF_dt_melt[side=='start', ], aes(label=TF_name),
+		          color='black', size=1) +
+        theme_bw() +
+        xlab('relative position') +
+	    coord_cartesian(xlim=c(-900,900)) +
+	    scale_x_continuous(sec.axis=~abs(. + sec),
+						   breaks=break_vec)
+
+    p3 = ggplot(mean_dt, aes(x=x_rel, y=glm_HepG2, fill=glm_HepG2 > 0)) +
+        geom_histogram(stat='identity') +
+        theme_bw() +
+        ggtitle('GLM HepG2') +
+        ylab('coefficients') +
+        xlab('relative position') +
+        theme(legend.position="none",
+              plot.title=element_text(margin=margin(t=40,b=-30))) +
+        coord_cartesian(xlim=c(-900,900),
+                        ylim=c(glm_min, glm_max)) +
+        scale_x_continuous(sec.axis=~abs(. + sec),
+                           breaks=break_vec)
+
+    mean_melt = melt(mean_dt, measure.vars=c('CAGE_K562', 'CAGE_HepG2'),
+                     value.name='CAGE', variable.name='celltype')
+    mean_melt[,ystart:=ifelse(celltype=='CAGE_HepG2', 0, 1)]
+    mean_melt[,yend:=ifelse(celltype=='CAGE_HepG2', 1, 2)]
+    mean_melt[,i:=1:nrow(.SD)]
+
+    mean_melt_melt = melt(mean_melt[CAGE>0], measure.vars=c('ystart', 'yend'),
+                          value.name='y')
+    mean_melt_max = mean_melt_melt[CAGE%in%mean_dt[,c(max(CAGE_K562), max(CAGE_HepG2))],]
+
+    p4 = ggplot(mean_dt, aes(x=x_rel, y=CAGE_K562)) +
+        geom_histogram(stat='identity') +
+        theme_bw() +
+        ggtitle('CAGE K562') +
+        ylab('coefficients') +
+        xlab('relative position') +
+        theme(legend.position="none",
+              plot.title=element_text(margin=margin(t=40,b=-30))) +
+        coord_cartesian(xlim=c(-900,900),
+                        ylim=c(0, CAGE_max)) +
+        scale_x_continuous(sec.axis=~abs(. + sec),
+                           breaks=break_vec)
+
+    p5 = ggplot(mean_dt, aes(x=x_rel, y=CAGE_HepG2)) +
+        geom_histogram(stat='identity') +
+        theme_bw() +
+        ggtitle('CAGE HepG2') +
+        ylab('coefficients') +
+        xlab('relative position') +
+        theme(legend.position="none",
+              plot.title=element_text(margin=margin(t=40,b=-30))) +
+        coord_cartesian(xlim=c(-900,900),
+                        ylim=c(0, CAGE_max)) +
+        scale_x_continuous(sec.axis=~abs(. + sec),
+                           breaks=break_vec)
+
+    print(p1 + p2 + p3 + p4 + p5 + plot_annotation(title = name) +
+          plot_layout(ncol=1, heights=c(1.5,1,1.5,1,1)))
+}
+dev.off()
+
+```

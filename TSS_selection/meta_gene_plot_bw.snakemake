@@ -1,0 +1,382 @@
+import os
+import inspect
+import re
+import pandas
+
+filename = inspect.getframeinfo(inspect.currentframe()).filename
+path = os.path.dirname(os.path.abspath(filename))
+
+if 'META' in config:
+    meta = pandas.read_csv(config['META'], sep='\t')
+    for i, row in meta.iterrows():
+        if row['type'] not in config['window']:
+            config['window'][row['type']] = {}
+        config['window'][row['type']][row['name']] = {'signal': row['signal'],
+                                                      'control': row['control']}
+        dam_name = ''.join((re.match('(.*)_.*', row['name']).group(1),  '_Dam'))
+        config['name'][row['name']] = {'signal':row['name'],
+                                       'control':dam_name}
+        config['missingDataAsZero'][row['name']] = False
+
+if 'smooth_k' not in config:
+    config['smooth_k'] = 20
+
+
+
+def get_all(config, regex_list):
+    name_list = []
+    if 'regions' in config:
+        name_list.extend(config['regions'])
+    if 'transcripts' in config:
+        name_list.extend(config['transcripts'])
+    for name in name_list:
+        if 'window' in config:
+            for exp in config['window']:
+                for regex in regex_list:
+                    yield(regex.format(outdir=config['outdir'], name=name,
+                                       exp=exp,
+                                       **config['window_param']))
+
+
+
+rule all:
+    input:
+        get_all(config, ['{outdir}/scaled_runmean/{name}-{exp}.txt',
+                         '{outdir}/window_runmean/{name}-{exp}-{b}-{a}-{bs}.txt'])
+
+rule scaled_random:
+    input:
+        get_all(config, ['{outdir}/scaled_runmean/{name}-{exp}.txt',
+                         '{outdir}/scaled_runmean/{name}_random-{exp}.txt'])
+
+rule scaled_border:
+    input:
+        get_all(config, ['{outdir}/scaled_runmean/{name}-{exp}.txt',
+                         '{outdir}/window_runmean/{name}_border-{exp}-{b}-{a}-{bs}.txt'])
+rule center:
+    input:
+        get_all(config, ['{outdir}/window_runmean/{name}_center-{exp}-{b}-{a}-{bs}.txt',
+                         '{outdir}/window_runmean/{name}_random_center-{exp}-{b}-{a}-{bs}.txt'])
+
+
+
+rule border:
+    input:
+        get_all(config, ['{outdir}/window_runmean/{name}_border-{exp}-{b}-{a}-{bs}.txt'])
+
+rule scaled:
+    input:
+        get_all(config, ['{outdir}/scaled_runmean/{name}-{exp}.txt'])
+
+
+rule window:
+    input:
+        get_all(config, ['{outdir}/window_runmean/{name}-{exp}-{b}-{a}-{bs}.txt'])
+
+
+
+rule tss_selection:
+    input:
+        expand("{outdir}/report/{name}-{g_exp}-selection.html",
+               outdir=config['outdir'], name=config['transcripts'].keys(),
+               g_exp=config['transcript_selection'].keys())
+
+
+def get_matrix(config, wildcards):
+    yield('%s/matrix/%s.txt.gz' % wildcards.outdir, wildcards.name)
+
+
+
+rule plot_window_matrix:
+    input:
+        signal='{outdir}/window/{name}-{exp}-window-{up}-{down}-{binsize}.txt.gz',
+        bed=lambda wildcards: get_bed(config, wildcards),
+    output:
+        '{outdir}/window_runmean/{name}-{exp}-{up}-{down}-{binsize}.txt'
+    params:
+        binsize='{binsize}',
+        up='{up}',
+        k=config['smooth_k'],
+        signal_name='{exp}',
+        down='{down}'
+    wildcard_constraints:
+        name="[^-]+"
+    shell:
+        "{path}/scripts/run_mean_bw.R -s {input.signal}"
+        "                             -c {input.control}"
+        "                             -bs {params.binsize}"
+        "                             -a {params.down}"
+        "                             -b {params.up}"
+        "                             -k {params.k}"
+        "                             --stats {input.stats}"
+        "                             --bed {input.bed}"
+        "                             --exp {params.signal_name}"
+        "                             --ctrl {params.ctrl_name}"
+        "                             -o {output}"
+
+
+def get_bw(config, wildcards):
+    yield(config['window'][wildcards.exp])
+
+
+if 'scaled_param' in config:
+    rule plot_scaled_matrix:
+        input:
+            signal='{outdir}/scaled_window/{name}-{exp}.txt.gz',
+            bed='{outdir}/scaled_window/{name}-scaled-selection.bed'
+        output:
+            '{outdir}/scaled_runmean/{name}-{exp}.txt'
+        params:
+            binsize=config['scaled_param']['bs'],
+            up=config['scaled_param']['b'],
+            signal_name=lambda wildcards: config['name'][wildcards.exp],
+            down=config['scaled_param']['a'],
+            k=config['smooth_k'],
+            unscaled3=config['scaled_param']['unscaled3'],
+            unscaled5=config['scaled_param']['unscaled5'],
+            body_length=config['scaled_param']['body_length']
+        wildcard_constraints:
+            name="[^-]+"
+        shell:
+            "{path}/scripts/run_mean_bw.R -s {input.signal}"
+            "                             -bs {params.binsize}"
+            "                             -a {params.down}"
+            "                             -b {params.up}"
+            "                             -k {params.k}"
+            "                             -u3 {params.unscaled3}"
+            "                             -u5 {params.unscaled5}"
+            "                             --body {params.body_length}"
+            "                             --bed {input.bed}"
+            "                             --exp {params.signal_name}"
+            "                             -o {output}"
+            "                             --scaled TRUE"
+
+
+    rule scaled_matrix:
+        input:
+            window=lambda wildcards: get_bw(config, wildcards),
+            bed='{outdir}/scaled_window/{name}-scaled-selection.bed'
+        output:
+            '{outdir}/scaled_window/{name}-{exp}.txt.gz'
+        message:
+            "extracting matrix of sum {wildcards.signal} signal {params.up}bp "
+            "upstream and {params.down}bp downstream of {wildcards.name} TSS's "
+            "in bins of {params.binsize}bp."
+        params:
+            binsize=config['scaled_param']['bs'],
+            up=config['scaled_param']['b'],
+            down=config['scaled_param']['a'],
+            unscaled3=config['scaled_param']['unscaled3'],
+            unscaled5=config['scaled_param']['unscaled5'],
+            body_length=config['scaled_param']['body_length'],
+            missingDataAsZero=lambda wildcards: config['missingDataAsZero'][wildcards.exp],
+        threads:
+            10
+        wildcard_constraints:
+            name="[^-]+"
+        run:
+            cmd = ("computeMatrix scale-regions -S {input.window} "
+                   "                            -R {input.bed} "
+                   "                            -p {threads}"
+                   "                            --sortRegions keep"
+                   "                            --averageTypeBins sum"
+                   "                            --binSize={params.binsize}"
+                   "                            -a {params.down} -b {params.up} "
+                   "                            --unscaled3prime {params.unscaled3}"
+                   "                            --unscaled5prime {params.unscaled5}"
+                   "                            -m {params.body_length}"
+                   "                            --outFileName {output}")
+            if params.missingDataAsZero:
+                cmd = ' '.join((cmd, '--missingDataAsZero'))
+            shell(cmd)
+
+
+    rule scaled_selection:
+        input:
+            bed=lambda wildcards: get_bed(config, wildcards)
+        output:
+            '{outdir}/scaled_window/{name}-scaled-selection.bed'
+        params:
+            body_length=config['scaled_param']['body_length'],
+        shell:
+            "awk '{{if ($3 - $2 > {params.body_length}){{print $0}}}}' {input}"
+            "    > {output}"
+
+
+def get_reference_point(wildcards):
+    if wildcards.name.endswith('_center'):
+        return('center')
+    else:
+        return('TSS')
+
+rule compute_matrix:
+    input:
+        window=lambda wildcards: get_bw(config, wildcards),
+        bed=lambda wildcards: get_bed(config, wildcards)
+    output:
+        '{outdir}/window/{name}-{exp}-window-{up}-{down}-{binsize}.txt.gz'
+    message:
+        "extracting matrix of {wildcards.exp} signal {wildcards.up}bp "
+        "upstream and {wildcards.down}bp downstream of {wildcards.name} TSS's "
+        "in bins of {wildcards.binsize}bp."
+    params:
+        binsize='{binsize}',
+        up='{up}',
+        down='{down}',
+        missingDataAsZero= lambda wildcards: config['missingDataAsZero'][wildcards.exp],
+        refpoint= lambda wildcards: get_reference_point(wildcards)
+    wildcard_constraints:
+        name="[^-]+"
+    threads:
+        10
+    run:
+        cmd = ("computeMatrix reference-point -S {input.window} "
+               "                              -R {input.bed} "
+               "                              -p {threads}"
+               "                              --referencePoint {params.refpoint}"
+               "                              --averageTypeBins sum"
+               "                              --binSize={params.binsize}"
+               "                              -a {params.down} -b {params.up} "
+               "                              --outFileName {output}")
+        if params.missingDataAsZero:
+            cmd = ' '.join((cmd, '--missingDataAsZero'))
+        shell(cmd)
+
+
+rule centre_damid_to_bw:
+    input:
+        bg = '{outdir}/tracks/{exp}.txt',
+        cs = config['chrom_sizes']
+    output:
+        bw='{outdir}/tracks/{exp}.bw'
+    shell:
+        "bedGraphToBigWig {input.bg} {input.cs} {output}"
+
+def get_center(config, wildcards):
+    return(config['window']['dam'][wildcards.exp])
+
+
+def get_bed(config, wildcards):
+    if 'transcripts' in config and wildcards.name in config['transcripts'].keys():
+        return('{outdir}/selection/{name}-fantom-selection.bed'.format(**wildcards))
+    else:
+        if wildcards.name.endswith('_border'):
+            region = wildcards.name.replace('_border', '')
+            return('{outdir}/border/{region}.bed'.format(region=region, **wildcards))
+        elif wildcards.name.endswith('_random'):
+            region = wildcards.name.replace('_random', '')
+            return('{outdir}/random_draw/{region}.bed'.format(region=region, **wildcards))
+        elif wildcards.name.endswith('_center'):
+            region = wildcards.name.replace('_center', '')
+            if region.endswith('_random'):
+                region = region.replace('_random', '')
+                return('{outdir}/random_draw/{region}.bed'.format(region=region, **wildcards))
+            else:
+                return(config['regions'][region])
+        return(config['regions'][wildcards.name])
+
+
+rule get_border:
+    input:
+        lambda wildcards: get_bed(config, wildcards)
+    output:
+        '{outdir}/border/{name}.bed'
+    shell:
+        "{path}/scripts/get_border.awk {input} > {output}"
+
+rule random_draw:
+    input:
+        bed=lambda wildcards: get_bed(config, wildcards),
+        cs=config['chrom_sizes']
+    output:
+        '{outdir}/random_draw/{name}.bed'
+    shell:
+        "bedtools shuffle -i {input.bed} -g {input.cs} > {output}"
+
+
+rule report_tss_selection:
+    input:
+        lambda wildcards: config['transcripts'][wildcards.name],
+        tss="{outdir}/selection/{name}-{g_exp}-tss.txt.gz",
+        exp="{outdir}/selection/{name}-{g_exp}-tissue-expr.txt.gz",
+        report="%s/scripts/report_tss_selection.Rmd" % (path),
+    output:
+        html="{outdir}/report/{name}-{g_exp}-selection.html",
+        txt="{outdir}/selection/{name}-{g_exp}-selection.txt",
+        gff="{outdir}/selection/{name}-{g_exp}-selection.gff",
+        bed="{outdir}/selection/{name}-{g_exp}-selection.bed"
+    shell:
+        "{path}/scripts/make_report.R {input.report} {output.html} "
+        "                             {input.tss} {input.exp} {input[0]} "
+        "                             {output.txt} {output.gff} {output.bed}"
+
+
+
+## If TSS's are closer together, let's take the TSS that is generally most
+## highly transcribed. For this we will need to have some information on
+## transcription rates across fantom5 dataset.
+## might as well also count the number of tissues expressed, since this will
+## be used later.
+
+
+rule tss_global_expression:
+    input:
+        link="{outdir}/selection/{name}-{g_exp}-link.txt",
+        exp=config["tissue_expression"]
+    output:
+        "{outdir}/selection/{name}-{g_exp}-tissue-expr.txt.gz"
+    message:
+        "calculating sum of expression normalized over input for each tss "
+        "in {wildcards.name} (used to select high expressing TSS's) and "
+        "counting number of samples with > 0 expression"
+    shell:
+        "{path}/scripts/tss_fantom_expression.sh -l {input.link} "
+        "                                        -e {input.exp} > {output}"
+
+
+
+## For multiple transcripts coming from the same gene, we want to select
+## transcription start sites at least 500bp apart.
+
+## select unique transcript start sites which overlap with a cage peak.
+## CAGE peaks have at least 1 transcript in one of the tissues.
+## (multiple transcripts of same gene can start at same position we don't
+## want those).
+
+rule tss_exp_selection:
+    input:
+        tss="{outdir}/raw_data/{name}-tss.bed.gz",
+        exp=lambda wildcards: config["transcript_selection"][wildcards.g_exp]
+    output:
+        selection="{outdir}/selection/{name}-{g_exp}-tss.txt.gz",
+        link="{outdir}/selection/{name}-{g_exp}-link.txt"
+    params:
+        dist=50
+    message:
+        "selecting {wildcards.name} transcription start sites which are <  "
+        "{params.dist}bp away from peaks in {wildcards.g_exp} and "
+        "writing table linking identifiers."
+    run:
+        print("{path}/scripts/tss_exp_selection_overlap.sh -t {tss} "
+                "                                            -d {dist} "
+                "                                            -e {exp} "
+                "                                            -s {selection} "
+                "                                            -l {link}".format(**input, **output, ** params,path=path))
+        shell("{path}/scripts/tss_exp_selection_overlap.sh -t {input.tss} "
+              "                                            -d {params.dist} "
+              "                                            -e {input.exp} "
+              "                                            -s {output.selection} "
+              "                                            -l {output.link}")
+
+
+
+## select all transcript start sites from gff
+rule gff_to_tss_bed:
+    input:
+        lambda wildcards: config["transcripts"][wildcards.name]
+    output:
+        "{outdir}/raw_data/{name}-tss.bed.gz"
+    message:
+        "selecting all transcription start sites from {input}"
+    shell:
+        "{path}/scripts/gff_to_tss_bed.sh {input} > {output}"
